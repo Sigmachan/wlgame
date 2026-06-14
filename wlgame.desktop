@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=wlgame
+Comment=Gaming-focused Wayland compositor with NVIDIA support
+Exec=wlgame
+Type=Application
