@@ -19,3 +19,8 @@ struct wlgame_gpu_info {
  * Call before creating the wlr_backend — env vars must be set before DRM opens. */
 struct wlgame_gpu_info gpu_detect_and_apply(void);
 void gpu_print_info(const struct wlgame_gpu_info *info);
+
+/* Resolve a render-GPU selector ("nvidia"/"amd"/"intel"/"discrete" or an
+ * explicit /dev/dri/renderD* path) to a render-node path. Returns a malloc'd
+ * string the caller must free, or NULL if no match. */
+char *gpu_resolve_render_node(const char *want);

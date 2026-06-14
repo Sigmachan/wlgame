@@ -45,6 +45,11 @@ Game integration:
   -m, --mangoapp             Auto-spawn the mangoapp performance overlay
       --prefer-wayland       Hint Proton/SDL/Qt to use native Wayland
 
+Multi-GPU:
+  -g, --gpu <sel>            Render on this GPU, scan out on the display GPU
+                             (reverse-PRIME). sel: nvidia|amd|intel|discrete
+                             or a /dev/dri/renderD* path
+
 Misc:
   -d, --debug                Debug logging
   -h, --help                 Help
@@ -61,7 +66,22 @@ wlgame -o 2560x1440 --prefer-wayland -- %command%
 
 # Frame-cap a title to 116 fps to stay inside a 120 Hz VRR window:
 wlgame --fps 116 -- %command%
+
+# Reverse-PRIME: monitor on the iGPU, render on the discrete GPU:
+wlgame --gpu nvidia -o 3840x2160@120 -F fsr1 -- %command%
 ```
+
+## Multi-GPU (reverse-PRIME)
+
+If your monitor is plugged into the motherboard (iGPU) but you want the discrete
+card to do the work, `--gpu nvidia` (or `--gpu discrete`, or a render-node path)
+sets `WLR_RENDER_DRM_DEVICE` so wlroots renders on that GPU and scans out on the
+GPU that owns the connected display, copying frames across per-output. The
+normal compositing path uses wlroots' multi-GPU support; the internal-res
+upscale path (`-r`) runs the FSR/NIS pass on the render GPU, which is best
+paired with the display also on that GPU — cross-GPU scanout of the upscaled
+buffer depends on driver dmabuf compatibility. If wlroots picks the wrong card,
+override scanout with `WLR_DRM_DEVICES=/dev/dri/card1`.
 
 When a `-- command` is given, wlgame launches it once the compositor socket is
 live, exports `WAYLAND_DISPLAY` and (if XWayland is built) `DISPLAY`, and tracks

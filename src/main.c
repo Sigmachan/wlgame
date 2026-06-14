@@ -56,6 +56,11 @@ static void print_usage(const char *prog) {
 		"  -m, --mangoapp             Auto-spawn the mangoapp performance overlay\n"
 		"      --prefer-wayland       Hint Proton/SDL/Qt to use native Wayland\n"
 		"\n"
+		"Multi-GPU:\n"
+		"  -g, --gpu <sel>            Render on this GPU, scan out on the display GPU\n"
+		"                             (reverse-PRIME). sel: nvidia|amd|intel|discrete\n"
+		"                             or a /dev/dri/renderD* path\n"
+		"\n"
 		"Misc:\n"
 		"  -d, --debug                Enable debug logging\n"
 		"  -h, --help                 Show this help\n"
@@ -94,6 +99,7 @@ int main(int argc, char *argv[]) {
 		{ "sharpness",      required_argument, NULL, OPT_SHARPNESS },
 		{ "shader-dir",     required_argument, NULL, OPT_SHADER_DIR },
 		{ "mangoapp",       no_argument,       NULL, 'm' },
+		{ "gpu",            required_argument, NULL, 'g' },
 		{ "prefer-wayland", no_argument,       NULL, OPT_PREFER_WAYLAND },
 		{ "debug",          no_argument,       NULL, 'd' },
 		{ "help",           no_argument,       NULL, 'h' },
@@ -102,7 +108,7 @@ int main(int argc, char *argv[]) {
 
 	int c;
 	/* leading '+' => stop at the first non-option so `--` ends our parsing */
-	while ((c = getopt_long(argc, argv, "+o:r:fF:s:tmdh", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+o:r:fF:s:tmg:dh", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'o':
 			if (!parse_geometry(optarg, &cfg.output_width,
@@ -136,6 +142,7 @@ int main(int argc, char *argv[]) {
 		case OPT_SHARPNESS:    cfg.sharpness = strtof(optarg, NULL); break;
 		case OPT_SHADER_DIR:   cfg.shader_dir = optarg; break;
 		case 'm':              cfg.mangoapp = true; break;
+		case 'g':              cfg.render_gpu = optarg; break;
 		case OPT_PREFER_WAYLAND: cfg.prefer_wayland = true; break;
 		case 'd':              cfg.debug = true; break;
 		case 'h':              print_usage(argv[0]); return 0;

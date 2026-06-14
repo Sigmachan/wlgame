@@ -99,6 +99,21 @@ void server_init(struct wlgame_server *server, const struct wlgame_config *cfg) 
 	server->prefer_wayland = cfg->prefer_wayland;
 	server->child_argv     = cfg->child_argv;
 
+	/* Reverse-PRIME: force the renderer onto a specific GPU (e.g. the discrete
+	 * 5090) while the DRM backend scans out on whichever card has the connected
+	 * monitor (e.g. the iGPU). Must be set before the renderer is created. */
+	if (cfg->render_gpu) {
+		char *node = gpu_resolve_render_node(cfg->render_gpu);
+		if (node) {
+			setenv("WLR_RENDER_DRM_DEVICE", node, 1);
+			wlr_log(WLR_INFO, "[wlgame] render GPU: %s (selector: %s)", node, cfg->render_gpu);
+			free(node);
+		} else {
+			wlr_log(WLR_ERROR, "[wlgame] could not resolve --gpu '%s' to a render node",
+				cfg->render_gpu);
+		}
+	}
+
 	/* GPU detection sets WLR_RENDERER=vulkan etc. before backend creation */
 	struct wlgame_gpu_info gpu = gpu_detect_and_apply();
 	server->nvidia = gpu.nvidia;

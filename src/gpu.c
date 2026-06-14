@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define VENDOR_NVIDIA 0x10de
 #define VENDOR_AMD    0x1002
@@ -16,6 +17,39 @@ static unsigned int read_vendor(const char *path) {
 	fscanf(f, "%x", &v);
 	fclose(f);
 	return v;
+}
+
+char *gpu_resolve_render_node(const char *want) {
+	if (!want || !*want) return NULL;
+	if (want[0] == '/') return strdup(want);   /* explicit path */
+
+	unsigned int target;
+	if (!strcasecmp(want, "nvidia") || !strcasecmp(want, "discrete"))
+		target = VENDOR_NVIDIA;   /* the discrete card on this rig */
+	else if (!strcasecmp(want, "amd"))
+		target = VENDOR_AMD;
+	else if (!strcasecmp(want, "intel"))
+		target = VENDOR_INTEL;
+	else
+		return NULL;
+
+	glob_t g;
+	if (glob("/sys/class/drm/renderD*/device/vendor", 0, NULL, &g) != 0)
+		return NULL;
+
+	char *result = NULL;
+	for (size_t i = 0; i < g.gl_pathc && !result; i++) {
+		if (read_vendor(g.gl_pathv[i]) != target) continue;
+		const char *s = strstr(g.gl_pathv[i], "renderD");
+		if (!s) continue;
+		char node[64];
+		if (sscanf(s, "%63[^/]", node) != 1) continue;
+		char path[80];
+		snprintf(path, sizeof(path), "/dev/dri/%s", node);
+		result = strdup(path);
+	}
+	globfree(&g);
+	return result;
 }
 
 struct wlgame_gpu_info gpu_detect_and_apply(void) {

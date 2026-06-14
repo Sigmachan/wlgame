@@ -23,6 +23,11 @@ struct wlgame_config {
 	float sharpness;      /* [0.0, 1.0]                                      */
 	const char *shader_dir;
 
+	/* Render GPU when it differs from the display GPU (reverse-PRIME): render
+	 * on the discrete card, scan out on the iGPU that has the monitor.
+	 * Accepts "nvidia"/"amd"/"intel"/"discrete" or a /dev/dri/renderD* path. */
+	const char *render_gpu;
+
 	/* Game command following `--` on the CLI. NULL = bare session (no child,
 	 * compositor runs until Super+Q / SIGTERM). */
 	char *const *child_argv;
