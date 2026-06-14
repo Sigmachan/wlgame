@@ -38,6 +38,8 @@ struct wlgame_view {
 	/* XWayland-only listeners */
 	struct wl_listener request_activate;
 	struct wl_listener request_configure;
+	struct wl_listener associate;
+	struct wl_listener dissociate;
 };
 
 /* Returns the wlr_surface for either view type. */
