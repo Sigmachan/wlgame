@@ -1,0 +1,74 @@
+// FSR 1.0 — Edge Adaptive Spatial Upsampling (EASU pass).
+// Reads from lower-res input, writes to higher-res output.
+// Edge direction is estimated per-pixel; filter is elongated along the edge
+// and compressed across it to reduce stairstepping.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D input_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D output_img;
+
+layout(push_constant) uniform PC {
+    float input_width,  input_height;
+    float output_width, output_height;
+} pc;
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// Lanczos2 kernel
+float lanczos2(float x) {
+    const float PI = 3.14159265358979;
+    if (abs(x) < 1e-5) return 1.0;
+    if (abs(x) >= 2.0)  return 0.0;
+    float px  = PI * x;
+    float px2 = PI * x * 0.5;
+    return (sin(px) / px) * (sin(px2) / px2);
+}
+
+void main() {
+    ivec2 out_pos = ivec2(gl_GlobalInvocationID.xy);
+    if (out_pos.x >= int(pc.output_width) || out_pos.y >= int(pc.output_height)) return;
+
+    vec2 in_size = vec2(pc.input_width, pc.input_height);
+    vec2 in_px   = 1.0 / in_size;
+
+    // Map output pixel centre to input space
+    vec2 in_pos = (vec2(out_pos) + 0.5) / vec2(pc.output_width, pc.output_height) * in_size;
+    vec2 f      = fract(in_pos - 0.5);
+    vec2 base   = (floor(in_pos - 0.5) + 0.5) * in_px;
+
+    // 4×4 neighbourhood for gradient estimation
+    vec3 s[4][4];
+    for (int j = 0; j < 4; j++)
+        for (int i = 0; i < 4; i++)
+            s[j][i] = texture(input_tex, base + vec2(float(i-1), float(j-1)) * in_px).rgb;
+
+    // Sobel gradient from 2×2 centre block
+    float l00 = luma(s[1][1]), l10 = luma(s[1][2]);
+    float l01 = luma(s[2][1]), l11 = luma(s[2][2]);
+    float gx  = (l10 + l11) - (l00 + l01);
+    float gy  = (l01 + l11) - (l00 + l10);
+    float gl  = sqrt(gx*gx + gy*gy) + 1e-4;
+    gx /= gl;  gy /= gl;
+
+    // Anisotropic Lanczos2:
+    //   tight (×1.5) across edge normal (gx,gy)
+    //   wide  (×0.75) along edge tangent (-gy,gx)
+    vec3  color = vec3(0.0);
+    float wsum  = 0.0;
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            vec2  off   = vec2(float(i-1), float(j-1)) - f;
+            float perp  = dot(off, vec2(gx, gy));
+            float along = dot(off, vec2(-gy, gx));
+            float w     = lanczos2(perp * 1.5) * lanczos2(along * 0.75);
+            color += s[j][i] * w;
+            wsum  += w;
+        }
+    }
+
+    vec3 result = (wsum > 1e-4) ? color / wsum : s[1][1];
+    imageStore(output_img, out_pos, vec4(clamp(result, 0.0, 1.0), 1.0));
+}

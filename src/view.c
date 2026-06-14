@@ -9,6 +9,12 @@
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
 
+struct wlr_surface *view_get_surface(struct wlgame_view *view) {
+	if (view->type == WLGAME_VIEW_XWAYLAND)
+		return view->xw_surface->surface;
+	return view->xdg_toplevel->base->surface;
+}
+
 void view_focus(struct wlgame_view *view, struct wlr_surface *surface) {
 	if (!view) {
 		return;
@@ -29,7 +35,9 @@ void view_focus(struct wlgame_view *view, struct wlr_surface *surface) {
 	wlr_scene_node_raise_to_top(&view->scene_tree->node);
 	wl_list_remove(&view->link);
 	wl_list_insert(&server->views, &view->link);
-	wlr_xdg_toplevel_set_activated(view->xdg_toplevel, true);
+	if (view->type == WLGAME_VIEW_XDG) {
+		wlr_xdg_toplevel_set_activated(view->xdg_toplevel, true);
+	}
 
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
 	if (keyboard) {
@@ -62,7 +70,8 @@ struct wlgame_view *view_at(struct wlgame_server *server, double lx, double ly,
 
 static void view_check_game_mode(struct wlgame_view *view) {
 	struct wlgame_server *server = view->server;
-	struct wlr_surface *surface = view->xdg_toplevel->base->surface;
+	struct wlr_surface *surface = view_get_surface(view);
+	if (!surface) return;
 
 	enum wp_content_type_v1_type type =
 		wlr_surface_get_content_type_v1(server->content_type_manager, surface);
@@ -70,8 +79,9 @@ static void view_check_game_mode(struct wlgame_view *view) {
 	view->is_game = (type == WP_CONTENT_TYPE_V1_TYPE_GAME);
 
 	if (view->is_game != was_game) {
-		wlr_log(WLR_INFO, "[wlgame] view \"%s\" game_mode=%s",
-			view->xdg_toplevel->title ? view->xdg_toplevel->title : "?",
+		const char *title = (view->type == WLGAME_VIEW_XDG && view->xdg_toplevel->title)
+			? view->xdg_toplevel->title : "?";
+		wlr_log(WLR_INFO, "[wlgame] view \"%s\" game_mode=%s", title,
 			view->is_game ? "ON" : "OFF");
 	}
 }
@@ -79,7 +89,7 @@ static void view_check_game_mode(struct wlgame_view *view) {
 static void view_map(struct wl_listener *listener, void *data) {
 	struct wlgame_view *view = wl_container_of(listener, view, map);
 	view_check_game_mode(view);
-	view_focus(view, view->xdg_toplevel->base->surface);
+	view_focus(view, view_get_surface(view));
 }
 
 static void view_unmap(struct wl_listener *listener, void *data) {
@@ -117,6 +127,7 @@ static void view_request_resize(struct wl_listener *listener, void *data) {
 
 static void view_request_maximize(struct wl_listener *listener, void *data) {
 	struct wlgame_view *view = wl_container_of(listener, view, request_maximize);
+	if (view->type != WLGAME_VIEW_XDG) return;
 	wlr_xdg_toplevel_set_maximized(view->xdg_toplevel,
 		view->xdg_toplevel->requested.maximized);
 	wlr_xdg_surface_schedule_configure(view->xdg_toplevel->base);
@@ -124,6 +135,7 @@ static void view_request_maximize(struct wl_listener *listener, void *data) {
 
 static void view_request_fullscreen(struct wl_listener *listener, void *data) {
 	struct wlgame_view *view = wl_container_of(listener, view, request_fullscreen);
+	if (view->type != WLGAME_VIEW_XDG) return;
 	wlr_xdg_toplevel_set_fullscreen(view->xdg_toplevel,
 		view->xdg_toplevel->requested.fullscreen);
 	wlr_xdg_surface_schedule_configure(view->xdg_toplevel->base);

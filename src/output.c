@@ -1,11 +1,11 @@
 
 #include "output.h"
 #include "server.h"
+#include "upscale.h"
 #include "view.h"
 
 #include <assert.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <wayland-protocols/content-type-v1-enum.h>
 #include <wayland-protocols/tearing-control-v1-enum.h>
 #include <wlr/types/wlr_output.h>
@@ -16,10 +16,10 @@ static bool output_has_game_surface(struct wlgame_output *output) {
 	struct wlgame_server *server = output->server;
 	struct wlgame_view *view;
 	wl_list_for_each(view, &server->views, link) {
-		if (!view->xdg_toplevel->base->surface->mapped) {
+		struct wlr_surface *surface = view_get_surface(view);
+		if (!surface || !surface->mapped) {
 			continue;
 		}
-		struct wlr_surface *surface = view->xdg_toplevel->base->surface;
 
 		enum wp_tearing_control_v1_presentation_hint hint =
 			wlr_tearing_control_manager_v1_surface_hint_from_surface(
@@ -30,7 +30,7 @@ static bool output_has_game_surface(struct wlgame_output *output) {
 
 		enum wp_content_type_v1_type type =
 			wlr_surface_get_content_type_v1(server->content_type_manager, surface);
-		if (type == WP_CONTENT_TYPE_V1_TYPE_GAME) {
+		if (type == WP_CONTENT_TYPE_V1_TYPE_GAME || view->is_game) {
 			return true;
 		}
 	}
@@ -48,7 +48,8 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		return;
 	}
 
-	bool want_tearing = server->allow_tearing && output_has_game_surface(output);
+	bool want_game = output_has_game_surface(output);
+	bool want_tearing = server->allow_tearing && want_game;
 
 	struct wlr_output_state state;
 	wlr_output_state_init(&state);
@@ -58,7 +59,17 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		state.tearing_page_flip = true;
 	}
 
+	/* VRR: auto-enable adaptive sync when a game surface is active */
+	if (wlr_output->adaptive_sync_supported) {
+		wlr_output_state_set_adaptive_sync_enabled(&state, want_game);
+	}
+
 	wlr_scene_output_build_state(scene_output, &state, NULL);
+
+	/* Apply post-process upscaling (FSR1 / NIS / CAS) when active */
+	upscale_apply(&server->upscale, &state,
+		(uint32_t)wlr_output->width, (uint32_t)wlr_output->height);
+
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 

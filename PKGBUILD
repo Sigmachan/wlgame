@@ -10,11 +10,15 @@ depends=(
   wlroots-git
   wayland
   libxkbcommon
+  libdrm
+  vulkan-icd-loader
 )
 makedepends=(
   meson
   ninja
   wayland-protocols-git
+  glslang
+  vulkan-headers
   git
 )
 provides=(wlgame)

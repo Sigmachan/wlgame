@@ -1,0 +1,70 @@
+// NVIDIA Image Scaling — bicubic upsampling + adaptive sharpening.
+// When input == output size it operates as sharpener only.
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D input_tex;
+layout(binding = 1, rgba8) uniform writeonly image2D output_img;
+
+layout(push_constant) uniform PC {
+    float sharpness;
+    float input_width,  input_height;
+    float output_width, output_height;
+} pc;
+
+// Catmull-Rom cubic weight (Mitchell-Netravali B=0, C=0.5)
+float catrom(float x) {
+    x = abs(x);
+    if (x < 1.0) return 1.5*x*x*x - 2.5*x*x + 1.0;
+    if (x < 2.0) return -0.5*x*x*x + 2.5*x*x - 4.0*x + 2.0;
+    return 0.0;
+}
+
+vec3 bicubic(vec2 uv) {
+    vec2 sz  = vec2(pc.input_width, pc.input_height);
+    vec2 p   = uv * sz - 0.5;
+    vec2 f   = fract(p);
+    vec2 p0  = (floor(p) + 0.5) / sz;
+    vec2 dp  = 1.0 / sz;
+
+    vec3 col = vec3(0.0);
+    float ws = 0.0;
+    for (int j = -1; j <= 2; j++) {
+        float wy = catrom(float(j) - f.y);
+        for (int i = -1; i <= 2; i++) {
+            float wx = catrom(float(i) - f.x);
+            float w  = wx * wy;
+            col += texture(input_tex, p0 + vec2(float(i), float(j)) * dp).rgb * w;
+            ws  += w;
+        }
+    }
+    return col / max(ws, 1e-5);
+}
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= int(pc.output_width) || pos.y >= int(pc.output_height)) return;
+
+    vec2 out_uv = (vec2(pos) + 0.5) / vec2(pc.output_width, pc.output_height);
+    vec2 in_px  = 1.0 / vec2(pc.input_width, pc.input_height);
+
+    // Bicubic upsampled colour
+    vec3 upsampled = bicubic(out_uv);
+
+    // Adaptive sharpening taps (in input space)
+    vec3 c = texture(input_tex, out_uv).rgb;
+    vec3 n = texture(input_tex, out_uv + vec2(    0, -in_px.y)).rgb;
+    vec3 s = texture(input_tex, out_uv + vec2(    0,  in_px.y)).rgb;
+    vec3 e = texture(input_tex, out_uv + vec2( in_px.x,   0)).rgb;
+    vec3 w = texture(input_tex, out_uv + vec2(-in_px.x,   0)).rgb;
+
+    // Local contrast guides sharpening strength
+    vec3 mn       = min(min(n, s), min(e, w));
+    vec3 mx       = max(max(n, s), max(e, w));
+    vec3 contrast = (mx - mn) / max(mx, 1e-4);
+
+    vec3 laplacian = 4.0*c - n - s - e - w;
+    vec3 result    = upsampled + laplacian * (pc.sharpness * 0.3 * (1.0 - contrast * 0.5));
+
+    imageStore(output_img, pos, vec4(clamp(result, 0.0, 1.0), 1.0));
+}

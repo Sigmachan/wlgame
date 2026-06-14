@@ -1,7 +1,8 @@
 
 #include "server.h"
 #include "output.h"
-#include "nvidia.h"
+#include "gpu.h"
+#include "upscale.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -14,7 +15,6 @@
 #include <wlr/backend.h>
 #include <wlr/util/log.h>
 
-/* Forward declarations for handlers defined in other files */
 void server_new_xdg_toplevel(struct wl_listener *listener, void *data);
 void server_new_xdg_popup(struct wl_listener *listener, void *data);
 void server_new_input(struct wl_listener *listener, void *data);
@@ -25,6 +25,8 @@ void server_cursor_motion_absolute(struct wl_listener *listener, void *data);
 void server_cursor_button(struct wl_listener *listener, void *data);
 void server_cursor_axis(struct wl_listener *listener, void *data);
 void server_cursor_frame(struct wl_listener *listener, void *data);
+void server_new_xwayland_surface(struct wl_listener *listener, void *data);
+void server_new_layer_surface(struct wl_listener *listener, void *data);
 
 static void setup_color_manager(struct wlgame_server *server) {
 	size_t tf_len, primaries_len;
@@ -41,39 +43,37 @@ static void setup_color_manager(struct wlgame_server *server) {
 
 	struct wlr_color_manager_v1_options opts = {
 		.features = {
-			.parametric = true,
-			.set_primaries = true,
-			.set_luminances = true,
+			.parametric                    = true,
+			.set_primaries                 = true,
+			.set_luminances                = true,
 			.set_mastering_display_primaries = true,
-			.extended_target_volume = true,
+			.extended_target_volume        = true,
 		},
-		.render_intents = intents,
-		.render_intents_len = 3,
-		.transfer_functions = tfs,
+		.render_intents      = intents,
+		.render_intents_len  = 3,
+		.transfer_functions  = tfs,
 		.transfer_functions_len = tf_len,
-		.primaries = primaries,
-		.primaries_len = primaries_len,
+		.primaries           = primaries,
+		.primaries_len       = primaries_len,
 	};
 
 	server->color_manager = wlr_color_manager_v1_create(server->display, 1, &opts);
 	free(tfs);
 	free(primaries);
-
-	wlr_log(WLR_INFO, "[wlgame] color-management-v1: %zu TFs, %zu primaries sets advertised",
+	wlr_log(WLR_INFO, "[wlgame] color-management-v1: %zu TFs, %zu primaries",
 		tf_len, primaries_len);
 }
 
-static void setup_color_representation(struct wlgame_server *server) {
-	server->color_repr_manager =
-		wlr_color_representation_manager_v1_create_with_renderer(server->display, 1, server->renderer);
-}
-
-void server_init(struct wlgame_server *server, bool allow_tearing) {
+void server_init(struct wlgame_server *server, bool allow_tearing,
+                 enum wlgame_upscale_mode upscale_mode, float sharpness,
+                 const char *shader_dir) {
 	server->allow_tearing = allow_tearing;
 
-	nvidia_apply_env();
-	server->nvidia = nvidia_detect();
-	nvidia_print_info();
+	/* GPU detection sets WLR_RENDERER=vulkan etc. before backend creation */
+	struct wlgame_gpu_info gpu = gpu_detect_and_apply();
+	server->nvidia = gpu.nvidia;
+	server->amd    = gpu.amd;
+	gpu_print_info(&gpu);
 
 	server->display = wl_display_create();
 	struct wl_event_loop *loop = wl_display_get_event_loop(server->display);
@@ -89,8 +89,8 @@ void server_init(struct wlgame_server *server, bool allow_tearing) {
 	server->allocator = wlr_allocator_autocreate(server->backend, server->renderer);
 	assert(server->allocator);
 
-	/* Scene graph — layered for proper z-ordering */
-	server->scene = wlr_scene_create();
+	/* Scene graph — 5 layers, Z-ordered */
+	server->scene          = wlr_scene_create();
 	server->layer_background = wlr_scene_tree_create(&server->scene->tree);
 	server->layer_bottom     = wlr_scene_tree_create(&server->scene->tree);
 	server->layer_normal     = wlr_scene_tree_create(&server->scene->tree);
@@ -98,45 +98,44 @@ void server_init(struct wlgame_server *server, bool allow_tearing) {
 	server->layer_overlay    = wlr_scene_tree_create(&server->scene->tree);
 
 	server->output_layout = wlr_output_layout_create(server->display);
-	server->scene_layout = wlr_scene_attach_output_layout(server->scene, server->output_layout);
+	server->scene_layout  = wlr_scene_attach_output_layout(server->scene, server->output_layout);
 
-	/* Core protocols */
+	/* Core */
 	server->compositor = wlr_compositor_create(server->display, 6, server->renderer);
 	wlr_subcompositor_create(server->display);
 	wlr_data_device_manager_create(server->display);
 	wlr_shm_create_with_renderer(server->display, 2, server->renderer);
 
-	/* XDG shell */
+	/* XDG shell v6 */
 	server->xdg_shell = wlr_xdg_shell_create(server->display, 6);
 	server->new_xdg_toplevel.notify = server_new_xdg_toplevel;
 	wl_signal_add(&server->xdg_shell->events.new_toplevel, &server->new_xdg_toplevel);
 	server->new_xdg_popup.notify = server_new_xdg_popup;
 	wl_signal_add(&server->xdg_shell->events.new_popup, &server->new_xdg_popup);
 
-	/* --- Staging protocols --- */
+	/* ── Staging protocols ─────────────────────────────────────────────── */
 
-	/* Tearing control: games opt-in to async flips */
+	/* Tearing: game surfaces opt in to async page flips */
 	server->tearing_manager = wlr_tearing_control_manager_v1_create(server->display, 1);
 
-	/* Content type: clients self-identify as game/video/photo */
+	/* Content type: games self-identify for tearing + upscale decisions */
 	server->content_type_manager = wlr_content_type_manager_v1_create(server->display, 1);
 
-	/* Color management: full HDR/wide-gamut pipeline */
+	/* HDR / wide-gamut (PQ, BT.2020, DCI-P3, mastering metadata) */
 	setup_color_manager(server);
-	setup_color_representation(server);
+	server->color_repr_manager =
+		wlr_color_representation_manager_v1_create_with_renderer(server->display, 1, server->renderer);
 
-	/* Fractional scaling */
+	/* Scaling */
 	server->fractional_scale_manager =
 		wlr_fractional_scale_manager_v1_create(server->display, 1);
-
-	/* Alpha modifier */
 	server->alpha_modifier = wlr_alpha_modifier_v1_create(server->display);
 
-	/* Cursor shape (no cursor surface required from clients) */
+	/* Cursor */
 	server->cursor_shape_manager =
 		wlr_cursor_shape_manager_v1_create(server->display, 1);
 
-	/* Explicit GPU sync — critical on NVIDIA (fixes corruption with async drivers) */
+	/* Explicit GPU sync — critical on NVIDIA (fixes async Vulkan driver corruption) */
 	int drm_fd = wlr_backend_get_drm_fd(server->backend);
 	if (drm_fd >= 0) {
 		server->syncobj_manager =
@@ -144,34 +143,53 @@ void server_init(struct wlgame_server *server, bool allow_tearing) {
 		wlr_log(WLR_INFO, "[wlgame] linux-drm-syncobj-v1: active (drm_fd=%d)", drm_fd);
 	}
 
-	/* --- Standard gaming-useful protocols --- */
-
+	/* ── Standard protocols ─────────────────────────────────────────────── */
 	server->linux_dmabuf =
 		wlr_linux_dmabuf_v1_create_with_renderer(server->display, 5, server->renderer);
-	server->viewporter = wlr_viewporter_create(server->display);
-	server->presentation = wlr_presentation_create(server->display, server->backend, 2);
-	server->output_manager = wlr_output_manager_v1_create(server->display);
+	server->viewporter       = wlr_viewporter_create(server->display);
+	server->presentation     = wlr_presentation_create(server->display, server->backend, 2);
+	server->output_manager   = wlr_output_manager_v1_create(server->display);
 	server->xdg_decoration_manager =
 		wlr_xdg_decoration_manager_v1_create(server->display, 1);
-	server->idle_notifier = wlr_idle_notifier_v1_create(server->display);
+	server->idle_notifier    = wlr_idle_notifier_v1_create(server->display);
 	server->gamma_control_manager = wlr_gamma_control_manager_v1_create(server->display);
-	server->screencopy_manager = wlr_screencopy_manager_v1_create(server->display);
-	server->export_dmabuf_manager = wlr_export_dmabuf_manager_v1_create(server->display);
-	server->single_pixel_manager = wlr_single_pixel_buffer_manager_v1_create(server->display);
-	server->foreign_toplevel_list = wlr_ext_foreign_toplevel_list_v1_create(server->display, 1);
+	server->single_pixel_manager  = wlr_single_pixel_buffer_manager_v1_create(server->display);
+	server->foreign_toplevel_list =
+		wlr_ext_foreign_toplevel_list_v1_create(server->display, 1);
 	server->xdg_activation = wlr_xdg_activation_v1_create(server->display);
+	server->data_control_manager =
+		wlr_data_control_manager_v1_create(server->display);
 
-	/* Output */
+	/* ── Screencopy / capture (for OBS, game overlays, screenshots) ────── */
+	server->image_copy_capture_manager =
+		wlr_ext_image_copy_capture_manager_v1_create(server->display, 1);
+	server->output_image_capture =
+		wlr_ext_output_image_capture_source_manager_v1_create(server->display, 1);
+
+	/* ── Security / session ─────────────────────────────────────────────── */
+	server->security_context_manager =
+		wlr_security_context_manager_v1_create(server->display);
+	server->session_lock_manager = wlr_session_lock_manager_v1_create(server->display);
+
+	/* ── Workspace management ───────────────────────────────────────────── */
+	server->workspace_manager = wlr_ext_workspace_manager_v1_create(server->display, 1);
+
+	/* ── Layer shell (MangoHud, Steam overlay, game HUDs) ───────────────── */
+	server->layer_shell = wlr_layer_shell_v1_create(server->display, 4);
+	server->new_layer_surface.notify = server_new_layer_surface;
+	wl_signal_add(&server->layer_shell->events.new_surface, &server->new_layer_surface);
+	wlr_log(WLR_INFO, "[wlgame] layer-shell-v1: active");
+
+	/* ── Outputs ─────────────────────────────────────────────────────────── */
 	wl_list_init(&server->outputs);
 	server->new_output.notify = output_new;
 	wl_signal_add(&server->backend->events.new_output, &server->new_output);
 
-	/* Views */
 	wl_list_init(&server->views);
 
-	/* Seat + cursor */
-	server->seat = wlr_seat_create(server->display, "seat0");
-	server->cursor = wlr_cursor_create();
+	/* ── Seat + cursor ──────────────────────────────────────────────────── */
+	server->seat    = wlr_seat_create(server->display, "seat0");
+	server->cursor  = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server->cursor, server->output_layout);
 	server->cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
 
@@ -191,7 +209,35 @@ void server_init(struct wlgame_server *server, bool allow_tearing) {
 	server->seat_request_cursor.notify = server_seat_request_cursor;
 	wl_signal_add(&server->seat->events.request_set_cursor, &server->seat_request_cursor);
 	server->seat_request_set_selection.notify = server_seat_request_set_selection;
-	wl_signal_add(&server->seat->events.request_set_selection, &server->seat_request_set_selection);
+	wl_signal_add(&server->seat->events.request_set_selection,
+		&server->seat_request_set_selection);
+
+	/* ── XWayland (X11 legacy game compat) ─────────────────────────────── */
+#ifdef HAVE_XWAYLAND
+	server->xwayland = wlr_xwayland_create(server->display, server->compositor, true);
+	if (server->xwayland) {
+		server->new_xwayland_surface.notify = server_new_xwayland_surface;
+		wl_signal_add(&server->xwayland->events.new_surface,
+			&server->new_xwayland_surface);
+		wlr_xwayland_set_seat(server->xwayland, server->seat);
+		setenv("DISPLAY", server->xwayland->display_name, true);
+		wlr_log(WLR_INFO, "[wlgame] XWayland: active on %s",
+			server->xwayland->display_name);
+	} else {
+		wlr_log(WLR_ERROR, "[wlgame] XWayland: failed to start");
+	}
+#else
+	wlr_log(WLR_INFO, "[wlgame] XWayland: disabled at build time");
+#endif
+
+	/* ── Upscaling pipeline ─────────────────────────────────────────────── */
+	/* Auto-select mode if user didn't specify */
+	if (upscale_mode == UPSCALE_NONE && (gpu.nvidia || gpu.amd)) {
+		upscale_mode = gpu.nvidia ? UPSCALE_NIS : UPSCALE_CAS;
+		wlr_log(WLR_INFO, "[wlgame] upscale: auto-selected %s for %s GPU",
+			upscale_mode_name(upscale_mode), gpu.nvidia ? "NVIDIA" : "AMD");
+	}
+	upscale_init(&server->upscale, server->renderer, upscale_mode, sharpness, shader_dir);
 }
 
 void server_run(struct wlgame_server *server) {
@@ -199,9 +245,12 @@ void server_run(struct wlgame_server *server) {
 	assert(socket);
 	setenv("WAYLAND_DISPLAY", socket, true);
 
-	wlr_log(WLR_INFO, "[wlgame] Wayland socket: %s", socket);
-	wlr_log(WLR_INFO, "[wlgame] NVIDIA: %s", server->nvidia ? "yes" : "no");
-	wlr_log(WLR_INFO, "[wlgame] Tearing: %s", server->allow_tearing ? "allowed" : "vsync-only");
+	wlr_log(WLR_INFO, "[wlgame] socket: %s | NVIDIA=%s AMD=%s | tearing=%s | upscale=%s",
+		socket,
+		server->nvidia ? "yes" : "no",
+		server->amd    ? "yes" : "no",
+		server->allow_tearing ? "on" : "off",
+		upscale_mode_name(server->upscale.mode));
 
 	if (!wlr_backend_start(server->backend)) {
 		wlr_log(WLR_ERROR, "[wlgame] failed to start backend");
@@ -213,6 +262,7 @@ void server_run(struct wlgame_server *server) {
 }
 
 void server_fini(struct wlgame_server *server) {
+	upscale_fini(&server->upscale);
 	wlr_xcursor_manager_destroy(server->cursor_mgr);
 	wlr_cursor_destroy(server->cursor);
 	wlr_allocator_destroy(server->allocator);
