@@ -6,11 +6,18 @@
 
 #include <assert.h>
 #include <stdlib.h>
+#include <time.h>
 #include <wayland-protocols/content-type-v1-enum.h>
 #include <wayland-protocols/tearing-control-v1-enum.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/util/log.h>
+
+static int64_t now_ns(void) {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
 
 static bool output_has_game_surface(struct wlgame_output *output) {
 	struct wlgame_server *server = output->server;
@@ -48,7 +55,27 @@ static void output_frame(struct wl_listener *listener, void *data) {
 		return;
 	}
 
+	/* fps cap: throttle to the target by skipping vblanks. Returning without
+	 * sending frame-done also paces the client (the game) down to the cap. */
+	if (server->fps_limit > 0) {
+		int64_t now = now_ns();
+		int64_t interval = 1000000000LL / server->fps_limit;
+		if (output->last_present_ns != 0 &&
+		    now - output->last_present_ns < interval - interval / 16) {
+			wlr_output_schedule_frame(wlr_output);
+			return;
+		}
+		output->last_present_ns = now;
+	}
+
 	bool want_game = output_has_game_surface(output);
+
+	/* When a fullscreen game owns the screen and no post-process upscale is
+	 * active, wlr_scene can scan its buffer out directly (zero-copy). */
+	if (want_game && server->upscale.mode == UPSCALE_NONE && !output->scanout_logged) {
+		wlr_log(WLR_INFO, "[wlgame] direct scanout eligible on %s", wlr_output->name);
+		output->scanout_logged = true;
+	}
 	bool want_tearing = server->allow_tearing && want_game;
 
 	struct wlr_output_state state;
@@ -118,9 +145,31 @@ void output_new(struct wl_listener *listener, void *data) {
 	wlr_output_state_init(&state);
 	wlr_output_state_set_enabled(&state, true);
 
-	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
-	if (mode) {
-		wlr_output_state_set_mode(&state, mode);
+	int W = server->output_width, H = server->output_height, R = server->output_rate;
+	if (W > 0 && H > 0 && server->nested) {
+		/* Nested window: any size is fine, set it directly. Rate in mHz. */
+		wlr_output_state_set_custom_mode(&state, W, H, R > 0 ? R * 1000 : 0);
+	} else if (W > 0 && H > 0) {
+		/* DRM: pick the listed mode matching WxH (closest refresh to R). */
+		struct wlr_output_mode *best = NULL, *m;
+		wl_list_for_each(m, &wlr_output->modes, link) {
+			if (m->width != W || m->height != H) continue;
+			if (!best || (R > 0 &&
+			    abs(m->refresh - R * 1000) < abs(best->refresh - R * 1000))) {
+				best = m;
+			}
+		}
+		if (best) {
+			wlr_output_state_set_mode(&state, best);
+		} else {
+			wlr_log(WLR_ERROR, "[wlgame] no %dx%d mode on %s — using preferred",
+				W, H, wlr_output->name);
+			struct wlr_output_mode *pref = wlr_output_preferred_mode(wlr_output);
+			if (pref) wlr_output_state_set_mode(&state, pref);
+		}
+	} else {
+		struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
+		if (mode) wlr_output_state_set_mode(&state, mode);
 	}
 
 	wlr_output_commit_state(wlr_output, &state);

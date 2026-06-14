@@ -3,6 +3,7 @@
 #include "output.h"
 #include "gpu.h"
 #include "upscale.h"
+#include "launch.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -13,6 +14,10 @@
 #include <wlr/types/wlr_data_device.h>
 #include <wlr/types/wlr_shm.h>
 #include <wlr/backend.h>
+#include <wlr/backend/multi.h>
+#include <wlr/backend/wayland.h>
+#include <wlr/backend/x11.h>
+#include <wlr/backend/headless.h>
 #include <wlr/util/log.h>
 
 void server_new_xdg_toplevel(struct wl_listener *listener, void *data);
@@ -28,6 +33,18 @@ void server_cursor_frame(struct wl_listener *listener, void *data);
 void server_new_xwayland_surface(struct wl_listener *listener, void *data);
 void server_new_layer_surface(struct wl_listener *listener, void *data);
 
+/* Detect a nested (windowed) backend, and capture the concrete sub-backend so
+ * we can create its output. wlr_backend_autocreate returns a multi-backend, so
+ * the is_wl/is_x11/is_headless checks must run over its children. */
+static void find_nested_iter(struct wlr_backend *backend, void *data) {
+	struct wlgame_server *s = data;
+	if (wlr_backend_is_wl(backend) || wlr_backend_is_x11(backend) ||
+	    wlr_backend_is_headless(backend)) {
+		s->nested = true;
+		if (!s->nested_backend) s->nested_backend = backend;
+	}
+}
+
 static void setup_color_manager(struct wlgame_server *server) {
 	size_t tf_len, primaries_len;
 	enum wp_color_manager_v1_transfer_function *tfs =
@@ -41,13 +58,14 @@ static void setup_color_manager(struct wlgame_server *server) {
 		WP_COLOR_MANAGER_V1_RENDER_INTENT_ABSOLUTE,
 	};
 
+	/* wlroots 0.21 only implements the `parametric` feature so far and asserts
+	 * the rest (set_primaries / set_luminances / set_mastering /
+	 * extended_target_volume) must be false. Parametric image descriptions
+	 * still expose PQ / BT.2020 / DCI-P3 via the advertised TF + primaries enum
+	 * lists — which is exactly what HDR games signal. */
 	struct wlr_color_manager_v1_options opts = {
 		.features = {
-			.parametric                    = true,
-			.set_primaries                 = true,
-			.set_luminances                = true,
-			.set_mastering_display_primaries = true,
-			.extended_target_volume        = true,
+			.parametric = true,
 		},
 		.render_intents      = intents,
 		.render_intents_len  = 3,
@@ -64,10 +82,22 @@ static void setup_color_manager(struct wlgame_server *server) {
 		tf_len, primaries_len);
 }
 
-void server_init(struct wlgame_server *server, bool allow_tearing,
-                 enum wlgame_upscale_mode upscale_mode, float sharpness,
-                 const char *shader_dir) {
-	server->allow_tearing = allow_tearing;
+void server_init(struct wlgame_server *server, const struct wlgame_config *cfg) {
+	enum wlgame_upscale_mode upscale_mode = cfg->upscale_mode;
+	float sharpness        = cfg->sharpness;
+	const char *shader_dir = cfg->shader_dir;
+
+	server->allow_tearing  = cfg->tearing;
+	server->output_width   = cfg->output_width;
+	server->output_height  = cfg->output_height;
+	server->output_rate    = cfg->output_rate;
+	server->render_width   = cfg->render_width;
+	server->render_height  = cfg->render_height;
+	server->fps_limit      = cfg->fps_limit;
+	server->fullscreen     = cfg->fullscreen;
+	server->mangoapp       = cfg->mangoapp;
+	server->prefer_wayland = cfg->prefer_wayland;
+	server->child_argv     = cfg->child_argv;
 
 	/* GPU detection sets WLR_RENDERER=vulkan etc. before backend creation */
 	struct wlgame_gpu_info gpu = gpu_detect_and_apply();
@@ -81,6 +111,18 @@ void server_init(struct wlgame_server *server, bool allow_tearing,
 	struct wlr_session *session = NULL;
 	server->backend = wlr_backend_autocreate(loop, &session);
 	assert(server->backend);
+
+	/* A nested backend (running inside another Wayland/X11 session) renders to
+	 * a window; a DRM backend owns the display. This changes how outputs are
+	 * sized and created. */
+	server->nested = false;
+	server->nested_backend = NULL;
+	if (wlr_backend_is_multi(server->backend)) {
+		wlr_multi_for_each_backend(server->backend, find_nested_iter, server);
+	} else {
+		find_nested_iter(server->backend, server);
+	}
+	wlr_log(WLR_INFO, "[wlgame] backend: %s", server->nested ? "nested" : "DRM");
 
 	server->renderer = wlr_renderer_autocreate(server->backend);
 	assert(server->renderer);
@@ -245,23 +287,74 @@ void server_run(struct wlgame_server *server) {
 	assert(socket);
 	setenv("WAYLAND_DISPLAY", socket, true);
 
-	wlr_log(WLR_INFO, "[wlgame] socket: %s | NVIDIA=%s AMD=%s | tearing=%s | upscale=%s",
+	wlr_log(WLR_INFO, "[wlgame] socket: %s | NVIDIA=%s AMD=%s | tearing=%s | upscale=%s | fps=%s",
 		socket,
 		server->nvidia ? "yes" : "no",
 		server->amd    ? "yes" : "no",
 		server->allow_tearing ? "on" : "off",
-		upscale_mode_name(server->upscale.mode));
+		upscale_mode_name(server->upscale.mode),
+		server->fps_limit ? "capped" : "vsync");
 
 	if (!wlr_backend_start(server->backend)) {
 		wlr_log(WLR_ERROR, "[wlgame] failed to start backend");
 		exit(1);
 	}
 
+	/* Nested backends don't auto-create an output — make our window now so
+	 * the game has a surface to render into. output_new() sizes it. */
+	if (server->nested && server->nested_backend) {
+		int W = server->output_width  > 0 ? server->output_width  : 1920;
+		int H = server->output_height > 0 ? server->output_height : 1080;
+		if (wlr_backend_is_wl(server->nested_backend)) {
+			wlr_wl_output_create(server->nested_backend);
+		} else if (wlr_backend_is_x11(server->nested_backend)) {
+			wlr_x11_output_create(server->nested_backend);
+		} else if (wlr_backend_is_headless(server->nested_backend)) {
+			if (wl_list_empty(&server->outputs)) {
+				wlr_headless_add_output(server->nested_backend, W, H);
+			}
+		}
+		if (wl_list_empty(&server->outputs)) {
+			wlr_log(WLR_ERROR, "[wlgame] nested backend produced no output");
+		}
+	}
+
+	/* Spawn the wrapped game (if any) now that the socket is live. */
+	launch_init(server);
+
 	fprintf(stderr, "[wlgame] running on %s\n", socket);
 	wl_display_run(server->display);
 }
 
 void server_fini(struct wlgame_server *server) {
+	/* Stop the game before tearing down the graphics stack. */
+	launch_finish(server);
+
+	/* Detach every global listener before destroying the objects they hang
+	 * off — wlr_cursor_destroy (and friends) assert their signals are empty. */
+	wl_list_remove(&server->new_output.link);
+	wl_list_remove(&server->new_xdg_toplevel.link);
+	wl_list_remove(&server->new_xdg_popup.link);
+	wl_list_remove(&server->new_layer_surface.link);
+	wl_list_remove(&server->new_input.link);
+	wl_list_remove(&server->cursor_motion.link);
+	wl_list_remove(&server->cursor_motion_absolute.link);
+	wl_list_remove(&server->cursor_button.link);
+	wl_list_remove(&server->cursor_axis.link);
+	wl_list_remove(&server->cursor_frame.link);
+	wl_list_remove(&server->seat_request_cursor.link);
+	wl_list_remove(&server->seat_request_set_selection.link);
+
+#ifdef HAVE_XWAYLAND
+	if (server->xwayland) {
+		/* Detach our new_surface listener — wlr_xwayland_destroy asserts the
+		 * signal has no remaining listeners. */
+		wl_list_remove(&server->new_xwayland_surface.link);
+		wlr_xwayland_destroy(server->xwayland);
+		server->xwayland = NULL;
+	}
+#endif
+
 	upscale_fini(&server->upscale);
 	wlr_xcursor_manager_destroy(server->cursor_mgr);
 	wlr_cursor_destroy(server->cursor);

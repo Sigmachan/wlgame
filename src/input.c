@@ -43,15 +43,19 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	/* Alt+F4 closes focused window; Super+Q quits */
 	if ((mods & WLR_MODIFIER_ALT) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {
-			if (syms[i] == XKB_KEY_F4) {
-				struct wlgame_view *view;
-				wl_list_for_each(view, &server->views, link) {
-					if (view->xdg_toplevel->base->surface->mapped) {
-						wlr_xdg_toplevel_send_close(view->xdg_toplevel);
-						handled = true;
-						break;
-					}
+			if (syms[i] != XKB_KEY_F4) continue;
+			struct wlgame_view *view;
+			wl_list_for_each(view, &server->views, link) {
+				struct wlr_surface *s = view_get_surface(view);
+				if (!s || !s->mapped) continue;
+				/* XWayland views have no xdg_toplevel — close per type. */
+				if (view->type == WLGAME_VIEW_XDG) {
+					wlr_xdg_toplevel_send_close(view->xdg_toplevel);
+				} else {
+					wlr_xwayland_surface_close(view->xw_surface);
 				}
+				handled = true;
+				break;
 			}
 		}
 	}

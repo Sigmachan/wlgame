@@ -1,8 +1,10 @@
 #pragma once
 
 #include "upscale.h"
+#include "config.h"
 
 #include <stdbool.h>
+#include <sys/types.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
@@ -128,6 +130,24 @@ struct wlgame_server {
 
 	bool allow_tearing;
 
+	/* ── Runtime config (gamescope-style) ───────────────────────────────── */
+	int  output_width, output_height, output_rate;  /* 0 = auto/preferred   */
+	int  render_width, render_height;                /* nested internal res  */
+	int  fps_limit;                                  /* 0 = unlimited        */
+	bool fullscreen;
+	bool mangoapp;
+	bool prefer_wayland;
+	bool nested;            /* true on wayland/x11/headless backend          */
+	struct wlr_backend *nested_backend; /* concrete sub-backend, for outputs */
+	char *const *child_argv;
+
+	/* ── Child process lifecycle (per-game wrapper) ─────────────────────── */
+	pid_t child_pid;        /* wrapped game; 0 = none                        */
+	pid_t mango_pid;        /* mangoapp overlay; 0 = none                    */
+	int   child_status;     /* waitpid status, propagated as exit code       */
+	bool  child_exited;
+	struct wl_event_source *sigchld_source;
+
 	/* Listeners */
 	struct wl_listener new_output;
 	struct wl_listener new_xdg_toplevel;
@@ -145,8 +165,6 @@ struct wlgame_server {
 	struct wl_listener tearing_new_object;
 };
 
-void server_init(struct wlgame_server *server, bool allow_tearing,
-                 enum wlgame_upscale_mode upscale_mode, float sharpness,
-                 const char *shader_dir);
+void server_init(struct wlgame_server *server, const struct wlgame_config *cfg);
 void server_run(struct wlgame_server *server);
 void server_fini(struct wlgame_server *server);

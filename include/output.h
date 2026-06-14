@@ -1,6 +1,7 @@
 #pragma once
 
 
+#include <stdint.h>
 #include <wayland-server-core.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_scene.h>
@@ -14,6 +15,10 @@ struct wlgame_output {
 	struct wlr_scene_output *scene_output;
 
 	bool has_game_surface;
+
+	/* fps limiter: monotonic ns of the last presented frame (0 = none yet) */
+	int64_t last_present_ns;
+	bool    scanout_logged;
 
 	struct wl_listener frame;
 	struct wl_listener request_state;

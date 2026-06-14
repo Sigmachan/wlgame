@@ -69,6 +69,7 @@ sources = files(
   'src/gpu.c',
   'src/upscale.c',
   'src/layer.c',
+  'src/launch.c',
 )
 
 deps = [wlroots, wayland, xkbcommon, libdrm, vulkan, math_dep]
