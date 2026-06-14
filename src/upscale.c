@@ -108,16 +108,20 @@ static void destroy_images(struct wlgame_upscale *up) {
 static bool import_dmabuf_image(struct wlgame_upscale *up,
                                  const struct wlr_dmabuf_attributes *dmabuf,
                                  VkFormat fmt) {
-	VkSubresourceLayout plane_layout = {
-		.offset   = (VkDeviceSize)dmabuf->offset[0],
-		.size     = 0,
-		.rowPitch = (VkDeviceSize)dmabuf->stride[0],
-	};
+	/* Supply a layout for every plane — tiled/DCC modifiers (RADV render
+	 * targets, NVIDIA block-linear) expose a metadata plane, so a single
+	 * hardcoded layout makes vkCreateImage reject the modifier. */
+	VkSubresourceLayout plane_layouts[4] = {0};
+	int nplanes = dmabuf->n_planes > 4 ? 4 : dmabuf->n_planes;
+	for (int i = 0; i < nplanes; i++) {
+		plane_layouts[i].offset   = (VkDeviceSize)dmabuf->offset[i];
+		plane_layouts[i].rowPitch = (VkDeviceSize)dmabuf->stride[i];
+	}
 	VkImageDrmFormatModifierExplicitCreateInfoEXT mod_ci = {
 		.sType                       = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
 		.drmFormatModifier           = dmabuf->modifier,
-		.drmFormatModifierPlaneCount = (uint32_t)dmabuf->n_planes,
-		.pPlaneLayouts               = &plane_layout,
+		.drmFormatModifierPlaneCount = (uint32_t)nplanes,
+		.pPlaneLayouts               = plane_layouts,
 	};
 	VkExternalMemoryImageCreateInfo ext_ci = {
 		.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -138,22 +142,19 @@ static bool import_dmabuf_image(struct wlgame_upscale *up,
 		.sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
-	if (vkCreateImage(up->device, &img_ci, NULL, &up->input_image) != VK_SUCCESS)
+	VkResult cr = vkCreateImage(up->device, &img_ci, NULL, &up->input_image);
+	if (cr != VK_SUCCESS) {
+		wlr_log(WLR_ERROR, "[upscale] vkCreateImage failed (%d) fmt=0x%08x mod=0x%016llx planes=%d %ux%u stride0=%u",
+			cr, dmabuf->format, (unsigned long long)dmabuf->modifier,
+			dmabuf->n_planes, dmabuf->width, dmabuf->height, dmabuf->stride[0]);
 		return false;
+	}
 
-	/* Memory requirements */
-	VkImageMemoryRequirementsInfo2 req_info = {
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
-		.image = up->input_image,
-	};
-	VkMemoryDedicatedRequirements dedicated_req = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
-	};
-	VkMemoryRequirements2 mem_req = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
-		.pNext = &dedicated_req,
-	};
-	vkGetImageMemoryRequirements2(up->device, &req_info, &mem_req);
+	/* Memory requirements — use the core 1.0 entry point. wlroots builds a
+	 * Vulkan 1.0 dispatch, so the 1.1 vkGetImageMemoryRequirements2 trampoline
+	 * is NULL here; the dedicated-allocation hint is preserved via ded_alloc. */
+	VkMemoryRequirements mem_req;
+	vkGetImageMemoryRequirements(up->device, up->input_image, &mem_req);
 
 	int fd_dup = dup(dmabuf->fd[0]);
 	if (fd_dup < 0) { vkDestroyImage(up->device, up->input_image, NULL); up->input_image = VK_NULL_HANDLE; return false; }
@@ -169,11 +170,11 @@ static bool import_dmabuf_image(struct wlgame_upscale *up,
 		.image = up->input_image,
 	};
 	uint32_t mem_type = find_memory_type(up->phys_device,
-		mem_req.memoryRequirements.memoryTypeBits, 0);
+		mem_req.memoryTypeBits, 0);
 	VkMemoryAllocateInfo alloc_info = {
 		.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext           = &ded_alloc,
-		.allocationSize  = mem_req.memoryRequirements.size,
+		.allocationSize  = mem_req.size,
 		.memoryTypeIndex = mem_type,
 	};
 	if (vkAllocateMemory(up->device, &alloc_info, NULL, &up->input_mem) != VK_SUCCESS)
@@ -570,13 +571,12 @@ static void dispatch_compute(struct wlgame_upscale *up, VkPipeline pipeline,
 	vkWaitForFences(up->device, 1, &up->fence, VK_TRUE, UINT64_MAX);
 }
 
-void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
-                   uint32_t out_w, uint32_t out_h) {
-	if (!up->active || up->mode == UPSCALE_NONE) return;
-	if (!state->buffer) return;
+struct wlr_buffer *upscale_run(struct wlgame_upscale *up, struct wlr_buffer *in,
+                               uint32_t out_w, uint32_t out_h) {
+	if (!up->active || up->mode == UPSCALE_NONE || !in) return NULL;
 
 	struct wlr_dmabuf_attributes dmabuf;
-	if (!wlr_buffer_get_dmabuf(state->buffer, &dmabuf)) return;
+	if (!wlr_buffer_get_dmabuf(in, &dmabuf)) return NULL;
 
 	VkFormat fmt = drm_to_vk(dmabuf.format);
 	uint32_t in_w = (uint32_t)dmabuf.width, in_h = (uint32_t)dmabuf.height;
@@ -589,12 +589,12 @@ void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
 		destroy_images(up);
 		if (!import_dmabuf_image(up, &dmabuf, fmt)) {
 			wlr_log(WLR_ERROR, "[upscale] failed to import input DMA-BUF");
-			return;
+			return NULL;
 		}
 		if (!create_output_image(up, out_w, out_h, fmt)) {
 			wlr_log(WLR_ERROR, "[upscale] failed to create output image");
 			destroy_images(up);
-			return;
+			return NULL;
 		}
 		up->last_in_w = in_w; up->last_in_h = in_h;
 		up->last_out_w = out_w; up->last_out_h = out_h;
@@ -606,7 +606,7 @@ void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
 		if (up->input_image) vkDestroyImage(up->device, up->input_image, NULL);
 		if (up->input_mem)   vkFreeMemory(up->device, up->input_mem, NULL);
 		up->input_view = VK_NULL_HANDLE; up->input_image = VK_NULL_HANDLE; up->input_mem = VK_NULL_HANDLE;
-		if (!import_dmabuf_image(up, &dmabuf, fmt)) return;
+		if (!import_dmabuf_image(up, &dmabuf, fmt)) return NULL;
 		update_descriptors(up);
 	}
 
@@ -635,7 +635,7 @@ void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
 			out_w, out_h);
 		break;
 	}
-	default: return;
+	default: return NULL;
 	}
 
 	/* Get output row stride from VkSubresourceLayout */
@@ -646,10 +646,7 @@ void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
 	struct wlr_buffer *new_buf = make_output_wlr_buffer(
 		up->output_dma_fd, out_w, out_h,
 		(uint32_t)layout.rowPitch, dmabuf.format);
-	if (!new_buf) return;
-
-	wlr_buffer_drop(state->buffer);
-	state->buffer = new_buf;
+	return new_buf;
 }
 
 void upscale_fini(struct wlgame_upscale *up) {

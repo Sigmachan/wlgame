@@ -141,6 +141,12 @@ struct wlgame_server {
 	struct wlr_backend *nested_backend; /* concrete sub-backend, for outputs */
 	char *const *child_argv;
 
+	/* ── Internal-res virtual output (gamescope-style render scaling) ────── */
+	bool scaled;            /* render at render_w×render_h, upscale to output */
+	struct wlr_backend      *headless;          /* hosts the virtual output  */
+	struct wlr_output       *game_output;       /* what clients render into  */
+	struct wlr_scene_output *game_scene_output; /* scene's internal-res sink */
+
 	/* ── Child process lifecycle (per-game wrapper) ─────────────────────── */
 	pid_t child_pid;        /* wrapped game; 0 = none                        */
 	pid_t mango_pid;        /* mangoapp overlay; 0 = none                    */

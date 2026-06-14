@@ -40,6 +40,8 @@ static void print_usage(const char *prog) {
 		"\n"
 		"Output / display:\n"
 		"  -o, --output WxH[@Hz]      Output mode (DRM) or window size (nested)\n"
+		"  -r, --render WxH           Internal render resolution; the game renders\n"
+		"                             here and is upscaled to the output (needs nis/fsr1)\n"
 		"  -f, --fullscreen           Request a fullscreen window when nested\n"
 		"      --fps <N>              Cap presentation/frame-callbacks to N Hz\n"
 		"  -t, --tearing              Allow tearing (async page-flips) for games\n"
@@ -83,6 +85,7 @@ int main(int argc, char *argv[]) {
 	};
 	static const struct option longopts[] = {
 		{ "output",         required_argument, NULL, 'o' },
+		{ "render",         required_argument, NULL, 'r' },
 		{ "fullscreen",     no_argument,       NULL, 'f' },
 		{ "fps",            required_argument, NULL, OPT_FPS },
 		{ "tearing",        no_argument,       NULL, 't' },
@@ -99,12 +102,19 @@ int main(int argc, char *argv[]) {
 
 	int c;
 	/* leading '+' => stop at the first non-option so `--` ends our parsing */
-	while ((c = getopt_long(argc, argv, "+o:fF:s:tmdh", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "+o:r:fF:s:tmdh", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'o':
 			if (!parse_geometry(optarg, &cfg.output_width,
 			                    &cfg.output_height, &cfg.output_rate)) {
 				fprintf(stderr, "Invalid --output '%s' (expected WxH or WxH@Hz)\n", optarg);
+				return 1;
+			}
+			break;
+		case 'r':
+			if (!parse_geometry(optarg, &cfg.render_width,
+			                    &cfg.render_height, NULL)) {
+				fprintf(stderr, "Invalid --render '%s' (expected WxH)\n", optarg);
 				return 1;
 			}
 			break;

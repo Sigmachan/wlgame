@@ -124,6 +124,17 @@ void server_init(struct wlgame_server *server, const struct wlgame_config *cfg) 
 	}
 	wlr_log(WLR_INFO, "[wlgame] backend: %s", server->nested ? "nested" : "DRM");
 
+	/* Internal-res scaling: a headless "game" output at render_w×render_h that
+	 * clients render into, upscaled to the real output each frame. */
+	server->scaled = (server->render_width > 0 && server->render_height > 0);
+	if (server->scaled) {
+		server->headless = wlr_headless_backend_create(loop);
+		if (!server->headless) {
+			wlr_log(WLR_ERROR, "[wlgame] headless backend failed — disabling scaling");
+			server->scaled = false;
+		}
+	}
+
 	server->renderer = wlr_renderer_autocreate(server->backend);
 	assert(server->renderer);
 	wlr_renderer_init_wl_display(server->renderer, server->display);
@@ -279,6 +290,12 @@ void server_init(struct wlgame_server *server, const struct wlgame_config *cfg) 
 		wlr_log(WLR_INFO, "[wlgame] upscale: auto-selected %s for %s GPU",
 			upscale_mode_name(upscale_mode), gpu.nvidia ? "NVIDIA" : "AMD");
 	}
+	/* Scaling needs a *resizing* filter; CAS and none only sharpen at 1:1. */
+	if (server->scaled && (upscale_mode == UPSCALE_NONE || upscale_mode == UPSCALE_CAS)) {
+		upscale_mode = gpu.nvidia ? UPSCALE_NIS : UPSCALE_FSR1;
+		wlr_log(WLR_INFO, "[wlgame] scaled mode needs a resizing filter — using %s",
+			upscale_mode_name(upscale_mode));
+	}
 	upscale_init(&server->upscale, server->renderer, upscale_mode, sharpness, shader_dir);
 }
 
@@ -316,6 +333,39 @@ void server_run(struct wlgame_server *server) {
 		}
 		if (wl_list_empty(&server->outputs)) {
 			wlr_log(WLR_ERROR, "[wlgame] nested backend produced no output");
+		}
+	}
+
+	/* Internal-res virtual output: clients see and render at render_w×render_h;
+	 * the real output presents an upscaled copy (see present_scaled in output.c).
+	 * The game output goes in the layout (→ exposed as the only wl_output); the
+	 * real output stays out of the layout so clients can't pick it. */
+	if (server->scaled && server->headless) {
+		if (!wlr_backend_start(server->headless)) {
+			wlr_log(WLR_ERROR, "[wlgame] failed to start headless backend");
+		} else {
+			server->game_output = wlr_headless_add_output(server->headless,
+				server->render_width, server->render_height);
+			wlr_output_init_render(server->game_output, server->allocator, server->renderer);
+
+			struct wlr_output_state gst;
+			wlr_output_state_init(&gst);
+			wlr_output_state_set_enabled(&gst, true);
+			wlr_output_state_set_custom_mode(&gst,
+				server->render_width, server->render_height, 0);
+			wlr_output_commit_state(server->game_output, &gst);
+			wlr_output_state_finish(&gst);
+
+			struct wlr_output_layout_output *glo =
+				wlr_output_layout_add_auto(server->output_layout, server->game_output);
+			server->game_scene_output =
+				wlr_scene_output_create(server->scene, server->game_output);
+			wlr_scene_output_layout_add_output(server->scene_layout, glo,
+				server->game_scene_output);
+
+			wlr_log(WLR_INFO, "[wlgame] internal render %dx%d → upscale to output (%s)",
+				server->render_width, server->render_height,
+				upscale_mode_name(server->upscale.mode));
 		}
 	}
 
@@ -360,6 +410,10 @@ void server_fini(struct wlgame_server *server) {
 	wlr_cursor_destroy(server->cursor);
 	wlr_allocator_destroy(server->allocator);
 	wlr_renderer_destroy(server->renderer);
+	if (server->headless) {
+		wlr_backend_destroy(server->headless);
+		server->headless = NULL;
+	}
 	wlr_backend_destroy(server->backend);
 	wl_display_destroy(server->display);
 }

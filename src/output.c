@@ -44,10 +44,82 @@ static bool output_has_game_surface(struct wlgame_output *output) {
 	return false;
 }
 
+/* Scaled mode: render the scene at the internal resolution into the headless
+ * game output, FSR/NIS-upscale that buffer to this real output's size, and
+ * present it. Driven by the real output's frame (vblank) clock. */
+static void present_scaled(struct wlgame_output *output) {
+	struct wlgame_server *server = output->server;
+	struct wlr_output *real = output->wlr_output;
+	struct wlr_scene_output *game_so = server->game_scene_output;
+	if (!game_so) {
+		wlr_output_schedule_frame(real);
+		return;
+	}
+
+	/* fps cap: throttle the game by skipping presents + frame callbacks. */
+	if (server->fps_limit > 0) {
+		int64_t now = now_ns();
+		int64_t interval = 1000000000LL / server->fps_limit;
+		if (output->last_present_ns != 0 &&
+		    now - output->last_present_ns < interval - interval / 16) {
+			wlr_output_schedule_frame(real);
+			return;
+		}
+		output->last_present_ns = now;
+	}
+
+	/* Render the scene at internal resolution into the game output's buffer. */
+	struct wlr_output_state gs;
+	wlr_output_state_init(&gs);
+	if (!wlr_scene_output_build_state(game_so, &gs, NULL) || !gs.buffer) {
+		/* Nothing damaged this frame — keep the clock alive. */
+		wlr_output_state_finish(&gs);
+		wlr_output_schedule_frame(real);
+		return;
+	}
+
+	/* Upscale the internal-res frame to the real output size. */
+	struct wlr_buffer *up_buf = upscale_run(&server->upscale, gs.buffer,
+		(uint32_t)real->width, (uint32_t)real->height);
+	wlr_output_state_finish(&gs);   /* release the build buffer */
+
+	if (!up_buf) {
+		wlr_output_schedule_frame(real);
+		return;
+	}
+
+	/* Present the upscaled buffer on the real output. */
+	struct wlr_output_state rs;
+	wlr_output_state_init(&rs);
+	wlr_output_state_set_enabled(&rs, true);
+	wlr_output_state_set_buffer(&rs, up_buf);
+	if (!wlr_output_commit_state(real, &rs)) {
+		wlr_log(WLR_ERROR, "[wlgame] scaled present failed on %s", real->name);
+	}
+	wlr_output_state_finish(&rs);
+	wlr_buffer_drop(up_buf);
+
+	if (!output->scanout_logged) {
+		output->scanout_logged = true;
+		wlr_log(WLR_INFO, "[wlgame] scaled present active: %dx%d → %dx%d via %s",
+			server->render_width, server->render_height,
+			real->width, real->height, upscale_mode_name(server->upscale.mode));
+	}
+
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	wlr_scene_output_send_frame_done(game_so, &now);
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	struct wlgame_output *output = wl_container_of(listener, output, frame);
 	struct wlgame_server *server = output->server;
 	struct wlr_output *wlr_output = output->wlr_output;
+
+	if (server->scaled) {
+		present_scaled(output);
+		return;
+	}
 
 	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
 		server->scene, wlr_output);
@@ -93,12 +165,30 @@ static void output_frame(struct wl_listener *listener, void *data) {
 
 	wlr_scene_output_build_state(scene_output, &state, NULL);
 
-	/* Apply post-process upscaling (FSR1 / NIS / CAS) when active */
-	upscale_apply(&server->upscale, &state,
+	/* Post-process upscaling (FSR1 / NIS / CAS). At native res this is a
+	 * sharpening pass; it returns a new owned buffer or NULL when inactive. */
+	struct wlr_buffer *up_buf = upscale_run(&server->upscale, state.buffer,
 		(uint32_t)wlr_output->width, (uint32_t)wlr_output->height);
 
-	wlr_output_commit_state(wlr_output, &state);
-	wlr_output_state_finish(&state);
+	if (up_buf) {
+		wlr_output_state_finish(&state);   /* release the scene buffer */
+		struct wlr_output_state us;
+		wlr_output_state_init(&us);
+		wlr_output_state_set_enabled(&us, true);
+		if (want_tearing) {
+			us.tearing_page_flip = true;
+		}
+		if (wlr_output->adaptive_sync_supported) {
+			wlr_output_state_set_adaptive_sync_enabled(&us, want_game);
+		}
+		wlr_output_state_set_buffer(&us, up_buf);
+		wlr_output_commit_state(wlr_output, &us);
+		wlr_output_state_finish(&us);
+		wlr_buffer_drop(up_buf);
+	} else {
+		wlr_output_commit_state(wlr_output, &state);
+		wlr_output_state_finish(&state);
+	}
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
@@ -190,10 +280,16 @@ void output_new(struct wl_listener *listener, void *data) {
 
 	wl_list_insert(&server->outputs, &output->link);
 
-	struct wlr_output_layout_output *layout_output =
-		wlr_output_layout_add_auto(server->output_layout, wlr_output);
-	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
-	wlr_scene_output_layout_add_output(server->scene_layout, layout_output, output->scene_output);
+	/* In scaled mode the real output is NOT part of the scene/layout — it's a
+	 * dumb presenter for the upscaled game-output buffer, and must not be
+	 * exposed as a wl_output (clients render into the internal output instead). */
+	if (!server->scaled) {
+		struct wlr_output_layout_output *layout_output =
+			wlr_output_layout_add_auto(server->output_layout, wlr_output);
+		output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
+		wlr_scene_output_layout_add_output(server->scene_layout, layout_output,
+			output->scene_output);
+	}
 
 	setup_output_color(output);
 

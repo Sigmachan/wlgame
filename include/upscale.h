@@ -60,10 +60,12 @@ bool upscale_init(struct wlgame_upscale *up, struct wlr_renderer *renderer,
                   enum wlgame_upscale_mode mode, float sharpness,
                   const char *shader_dir);
 
-/* Apply upscaling to the output state buffer (swaps state->buffer in-place).
- * Call after wlr_scene_output_build_state(), before wlr_output_commit_state(). */
-void upscale_apply(struct wlgame_upscale *up, struct wlr_output_state *state,
-                   uint32_t out_w, uint32_t out_h);
+/* Upscale `in` (a composited scene buffer) to out_w×out_h. Returns a newly
+ * created wlr_buffer that the caller owns: pass it to wlr_output_state_set_buffer()
+ * then wlr_buffer_drop() once committed. Returns NULL if upscaling is inactive or
+ * failed (caller should present `in` unchanged). */
+struct wlr_buffer *upscale_run(struct wlgame_upscale *up, struct wlr_buffer *in,
+                               uint32_t out_w, uint32_t out_h);
 
 void upscale_fini(struct wlgame_upscale *up);
 
